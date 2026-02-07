@@ -110,6 +110,7 @@ public sealed class SyncServiceImpl : SyncService.SyncServiceBase
 
                         suppressApply = null;
                         response.Apply = ToAnyBlock(chainEvent.Block.Value);
+                        response.Tip = ToProto(chainEvent.Block.Value.Ref);
                     }
                     break;
                 case ChainEventKind.Undo:
@@ -122,15 +123,16 @@ public sealed class SyncServiceImpl : SyncService.SyncServiceBase
                     if (chainEvent.Point is not null)
                     {
                         response.Reset = ToProto(chainEvent.Point.Value);
+                        response.Tip = ToProto(chainEvent.Point.Value);
                     }
                     break;
             }
 
-            if (chainEvent.Tip is not null)
+            if (response.Tip is null && chainEvent.Tip is not null)
             {
                 response.Tip = ToProto(chainEvent.Tip.Value);
             }
-            else if (tip is not null)
+            else if (response.Tip is null && tip is not null)
             {
                 response.Tip = ToProto(tip.Value);
             }
