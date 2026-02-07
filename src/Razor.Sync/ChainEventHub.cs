@@ -54,6 +54,9 @@ public sealed class ChainEventHub : IChainEventSource, IDisposable
                 yield return item;
             }
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+        }
         finally
         {
             _channels.TryRemove(id, out _);

@@ -72,75 +72,86 @@ public sealed class SyncServiceImpl : SyncService.SyncServiceBase
 
     public override async Task FollowTip(FollowTipRequest request, IServerStreamWriter<FollowTipResponse> responseStream, ServerCallContext context)
     {
-        var tip = _blockStore.GetTip();
-        var intersection = TryResolveIntersection(request.Intersect) ?? tip;
-        CoreBlockRef? suppressApply = null;
-
-        if (intersection is not null)
+        try
         {
-            await responseStream.WriteAsync(
-                new FollowTipResponse
+            var tip = _blockStore.GetTip();
+            var intersection = TryResolveIntersection(request.Intersect) ?? tip;
+            CoreBlockRef? suppressApply = null;
+
+            if (intersection is not null)
+            {
+                await responseStream.WriteAsync(
+                    new FollowTipResponse
+                    {
+                        Reset = ToProto(intersection.Value),
+                        Tip = tip is not null ? ToProto(tip.Value) : ToProto(intersection.Value)
+                    },
+                    context.CancellationToken);
+
+                suppressApply = intersection.Value;
+            }
+
+            if (intersection is not null && tip is not null)
+            {
+                await StreamHistory(intersection.Value, tip.Value, responseStream, context.CancellationToken);
+            }
+
+            await foreach (var chainEvent in _events.Subscribe(context.CancellationToken))
+            {
+                var response = new FollowTipResponse();
+                switch (chainEvent.Kind)
                 {
-                    Reset = ToProto(intersection.Value),
-                    Tip = tip is not null ? ToProto(tip.Value) : ToProto(intersection.Value)
-                },
-                context.CancellationToken);
-
-            suppressApply = intersection.Value;
-        }
-
-        if (intersection is not null && tip is not null)
-        {
-            await StreamHistory(intersection.Value, tip.Value, responseStream, context.CancellationToken);
-        }
-
-        await foreach (var chainEvent in _events.Subscribe(context.CancellationToken))
-        {
-            var response = new FollowTipResponse();
-            switch (chainEvent.Kind)
-            {
-                case ChainEventKind.Apply:
-                    if (chainEvent.Block is not null)
-                    {
-                        if (suppressApply is not null && IsSameRef(chainEvent.Block.Value.Ref, suppressApply.Value))
+                    case ChainEventKind.Apply:
+                        if (chainEvent.Block is not null)
                         {
+                            if (suppressApply is not null && IsSameRef(chainEvent.Block.Value.Ref, suppressApply.Value))
+                            {
+                                suppressApply = null;
+                                continue;
+                            }
+
                             suppressApply = null;
-                            continue;
+                            response.Apply = ToAnyBlock(chainEvent.Block.Value);
+                            response.Tip = ToProto(chainEvent.Block.Value.Ref);
                         }
+                        break;
+                    case ChainEventKind.Undo:
+                        if (chainEvent.Block is not null)
+                        {
+                            response.Undo = ToAnyBlock(chainEvent.Block.Value);
+                        }
+                        break;
+                    case ChainEventKind.Reset:
+                        if (chainEvent.Point is not null)
+                        {
+                            response.Reset = ToProto(chainEvent.Point.Value);
+                            response.Tip = ToProto(chainEvent.Point.Value);
+                        }
+                        break;
+                }
 
-                        suppressApply = null;
-                        response.Apply = ToAnyBlock(chainEvent.Block.Value);
-                        response.Tip = ToProto(chainEvent.Block.Value.Ref);
-                    }
-                    break;
-                case ChainEventKind.Undo:
-                    if (chainEvent.Block is not null)
-                    {
-                        response.Undo = ToAnyBlock(chainEvent.Block.Value);
-                    }
-                    break;
-                case ChainEventKind.Reset:
-                    if (chainEvent.Point is not null)
-                    {
-                        response.Reset = ToProto(chainEvent.Point.Value);
-                        response.Tip = ToProto(chainEvent.Point.Value);
-                    }
-                    break;
-            }
+                if (response.Tip is null && chainEvent.Tip is not null)
+                {
+                    response.Tip = ToProto(chainEvent.Tip.Value);
+                }
+                else if (response.Tip is null && tip is not null)
+                {
+                    response.Tip = ToProto(tip.Value);
+                }
 
-            if (response.Tip is null && chainEvent.Tip is not null)
-            {
-                response.Tip = ToProto(chainEvent.Tip.Value);
+                if (response.ActionCase != FollowTipResponse.ActionOneofCase.None)
+                {
+                    await responseStream.WriteAsync(response, context.CancellationToken);
+                }
             }
-            else if (response.Tip is null && tip is not null)
-            {
-                response.Tip = ToProto(tip.Value);
-            }
-
-            if (response.ActionCase != FollowTipResponse.ActionOneofCase.None)
-            {
-                await responseStream.WriteAsync(response, context.CancellationToken);
-            }
+        }
+        catch (OperationCanceledException) when (context.CancellationToken.IsCancellationRequested)
+        {
+            _logger.LogDebug("FollowTip canceled by client.");
+        }
+        catch (RpcException ex) when (ex.StatusCode == StatusCode.Cancelled)
+        {
+            _logger.LogDebug("FollowTip canceled by client.");
         }
     }
 
