@@ -128,7 +128,7 @@ public class NodeService(ILoggerFactory loggerFactory, IOptions<NodeConfiguratio
                                         blockSlot);
                                     break;
                                 case MessageAwaitReply msg:
-                                _logger.LogInformation("Reached tip, waiting for new blocks");
+                                // _logger.LogInformation("Reached tip, waiting for new blocks");
                                     break;
                             }
                         }

@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="../Chrysalis/src/Chrysalis.Cbor.CodeGen/Chrysalis.Cbor.CodeGen.csproj" />
+  <Project Path="../Chrysalis/src/Chrysalis.Cbor/Chrysalis.Cbor.csproj" />
+  <Project Path="../Chrysalis/src/Chrysalis.Network/Chrysalis.Network.csproj" />
+  <Project Path="../Chrysalis/src/Chrysalis.Wallet/Chrysalis.Wallet.csproj" />
+  <Project Path="Razor.csproj" />
+</Solution>

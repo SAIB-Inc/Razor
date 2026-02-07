@@ -1,0 +1,9 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Razor.App/Razor.App.csproj" />
+    <Project Path="src/Razor.Core/Razor.Core.csproj" />
+    <Project Path="src/Razor.Storage/Razor.Storage.csproj" />
+    <Project Path="src/Razor.Sync/Razor.Sync.csproj" />
+    <Project Path="src/Razor.U5C/Razor.U5C.csproj" />
+  </Folder>
+</Solution>
