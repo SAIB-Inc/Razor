@@ -21,10 +21,10 @@
 - New clean layout under `src/` for the rebuild.
 - Use a small set of projects:
   - `Razor.Core` (domain interfaces + storage abstractions)
-  - `Razor.Sync` (ChainSync ingestion)
-  - `Razor.U5C` (gRPC services for v1alpha)
   - `Razor.Storage` (ZoneTree storage implementation)
-  - `Razor.App` (CLI entry point)
+  - `Razor.Sync` (Chrysalis ChainSync ingestion and chain event stream)
+  - `Razor.U5C` (U5C v1alpha gRPC service implementations and mappings)
+  - `Razor.App` (CLI/host for services and configuration wiring)
 
 ## Scaffold Status (Done)
 - `old/` now contains the previous PoC.
