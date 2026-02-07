@@ -60,7 +60,7 @@ public sealed class ZoneTreeBlockStore : IBlockStore
     public BlockRef? GetTip()
     {
         var key = TipKey;
-        if (!_tip.TryGet(ref key, out var payload))
+        if (!_tip.TryGet(in key, out var payload))
         {
             return null;
         }
@@ -77,41 +77,41 @@ public sealed class ZoneTreeBlockStore : IBlockStore
 
         Memory<byte> hashKey = record.Ref.Hash;
         Memory<byte> blockBytes = record.Bytes;
-        _blocksByHash.Upsert(ref hashKey, ref blockBytes);
+        _blocksByHash.Upsert(in hashKey, in blockBytes);
 
         Memory<byte> refValue = SerializeBlockRef(record.Ref);
-        _refByHash.Upsert(ref hashKey, ref refValue);
+        _refByHash.Upsert(in hashKey, in refValue);
 
         Memory<byte> slotKey = StorageKeys.SlotKey(record.Ref.Slot);
         Memory<byte> slotHash = record.Ref.Hash;
-        _hashBySlot.Upsert(ref slotKey, ref slotHash);
+        _hashBySlot.Upsert(in slotKey, in slotHash);
 
         if (record.Ref.Height != 0)
         {
             Memory<byte> heightKey = StorageKeys.HeightKey(record.Ref.Height);
             Memory<byte> heightHash = record.Ref.Hash;
-            _hashByHeight.Upsert(ref heightKey, ref heightHash);
+            _hashByHeight.Upsert(in heightKey, in heightHash);
         }
 
         Memory<byte> tipKey = TipKey;
         Memory<byte> tipValue = SerializeBlockRef(record.Ref);
-        _tip.Upsert(ref tipKey, ref tipValue);
+        _tip.Upsert(in tipKey, in tipValue);
     }
 
     public void RollbackTo(BlockRef point)
     {
         Memory<byte> tipKey = TipKey;
         Memory<byte> tipValue = SerializeBlockRef(point);
-        _tip.Upsert(ref tipKey, ref tipValue);
+        _tip.Upsert(in tipKey, in tipValue);
     }
 
     public bool TryGetByHash(byte[] hash, out BlockRecord record)
     {
         Memory<byte> hashKey = hash;
         Memory<byte> bytes = default;
-        if (_blocksByHash.TryGet(ref hashKey, out bytes))
+        if (_blocksByHash.TryGet(in hashKey, out bytes))
         {
-            if (_refByHash.TryGet(ref hashKey, out var refPayload))
+            if (_refByHash.TryGet(in hashKey, out var refPayload))
             {
                 record = new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray());
                 return true;
@@ -129,12 +129,12 @@ public sealed class ZoneTreeBlockStore : IBlockStore
     {
         Memory<byte> slotKey = StorageKeys.SlotKey(slot);
         Memory<byte> hash = default;
-        if (_hashBySlot.TryGet(ref slotKey, out hash))
+        if (_hashBySlot.TryGet(in slotKey, out hash))
         {
             Memory<byte> bytes = default;
-            if (_blocksByHash.TryGet(ref hash, out bytes))
+            if (_blocksByHash.TryGet(in hash, out bytes))
             {
-                if (_refByHash.TryGet(ref hash, out var refPayload))
+                if (_refByHash.TryGet(in hash, out var refPayload))
                 {
                     record = new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray());
                     return true;
@@ -153,12 +153,12 @@ public sealed class ZoneTreeBlockStore : IBlockStore
     {
         Memory<byte> heightKey = StorageKeys.HeightKey(height);
         Memory<byte> hash = default;
-        if (_hashByHeight.TryGet(ref heightKey, out hash))
+        if (_hashByHeight.TryGet(in heightKey, out hash))
         {
             Memory<byte> bytes = default;
-            if (_blocksByHash.TryGet(ref hash, out bytes))
+            if (_blocksByHash.TryGet(in hash, out bytes))
             {
-                if (_refByHash.TryGet(ref hash, out var refPayload))
+                if (_refByHash.TryGet(in hash, out var refPayload))
                 {
                     record = new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray());
                     return true;
@@ -183,7 +183,7 @@ public sealed class ZoneTreeBlockStore : IBlockStore
         if (startToken is not null)
         {
             Memory<byte> startKey = StorageKeys.SlotKey(startToken.Value.Slot);
-            iterator.Seek(ref startKey);
+            iterator.Seek(in startKey);
         }
         else
         {
@@ -208,9 +208,9 @@ public sealed class ZoneTreeBlockStore : IBlockStore
         while (true)
         {
             var hash = iterator.CurrentValue;
-            if (_blocksByHash.TryGet(ref hash, out var bytes))
+            if (_blocksByHash.TryGet(in hash, out var bytes))
             {
-                if (_refByHash.TryGet(ref hash, out var refPayload))
+                if (_refByHash.TryGet(in hash, out var refPayload))
                 {
                     results.Add(new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray()));
                 }
@@ -269,7 +269,7 @@ public sealed class ZoneTreeBlockStore : IBlockStore
 
     private BlockRef BuildRef(Memory<byte> slotKey, Memory<byte> hash)
     {
-        if (_refByHash.TryGet(ref hash, out var refPayload))
+        if (_refByHash.TryGet(in hash, out var refPayload))
         {
             return DeserializeBlockRef(refPayload.ToArray());
         }

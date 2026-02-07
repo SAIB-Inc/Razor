@@ -4,6 +4,7 @@ using Microsoft.Extensions.Logging;
 using Razor.Core.Storage;
 using Razor.Core.Sync;
 using Utxorpc.V1alpha.Sync;
+using Cardano = Utxorpc.V1alpha.Cardano;
 using CoreBlockRef = Razor.Core.Storage.BlockRef;
 using ProtoBlockRef = Utxorpc.V1alpha.Sync.BlockRef;
 
@@ -158,7 +159,23 @@ public sealed class SyncServiceImpl : SyncService.SyncServiceBase
     {
         return new AnyChainBlock
         {
-            NativeBytes = ByteString.CopyFrom(record.Bytes)
+            NativeBytes = ByteString.CopyFrom(record.Bytes),
+            Cardano = ToCardanoBlock(record)
+        };
+    }
+
+    private static Cardano.Block ToCardanoBlock(BlockRecord record)
+    {
+        return new Cardano.Block
+        {
+            Header = new Cardano.BlockHeader
+            {
+                Slot = record.Ref.Slot,
+                Hash = ByteString.CopyFrom(record.Ref.Hash),
+                Height = record.Ref.Height
+            },
+            Body = new Cardano.BlockBody(),
+            Timestamp = record.Ref.Timestamp
         };
     }
 
