@@ -12,6 +12,7 @@ public sealed class ZoneTreeBlockStore : IBlockStore
     private static readonly Memory<byte> TipKey = new byte[] { 0x01 };
 
     private readonly IZoneTree<Memory<byte>, Memory<byte>> _blocksByHash;
+    private readonly IZoneTree<Memory<byte>, Memory<byte>> _refByHash;
     private readonly IZoneTree<Memory<byte>, Memory<byte>> _hashBySlot;
     private readonly IZoneTree<Memory<byte>, Memory<byte>> _hashByHeight;
     private readonly IZoneTree<Memory<byte>, Memory<byte>> _tip;
@@ -22,6 +23,13 @@ public sealed class ZoneTreeBlockStore : IBlockStore
 
         _blocksByHash = new ZoneTreeFactory<Memory<byte>, Memory<byte>>()
             .SetDataDirectory(Path.Combine(rootPath, "blocks_by_hash"))
+            .SetComparer(new ByteArrayComparerAscending())
+            .SetKeySerializer(new ByteArraySerializer())
+            .SetValueSerializer(new ByteArraySerializer())
+            .OpenOrCreate();
+
+        _refByHash = new ZoneTreeFactory<Memory<byte>, Memory<byte>>()
+            .SetDataDirectory(Path.Combine(rootPath, "ref_by_hash"))
             .SetComparer(new ByteArrayComparerAscending())
             .SetKeySerializer(new ByteArraySerializer())
             .SetValueSerializer(new ByteArraySerializer())
@@ -71,6 +79,9 @@ public sealed class ZoneTreeBlockStore : IBlockStore
         Memory<byte> blockBytes = record.Bytes;
         _blocksByHash.Upsert(ref hashKey, ref blockBytes);
 
+        Memory<byte> refValue = SerializeBlockRef(record.Ref);
+        _refByHash.Upsert(ref hashKey, ref refValue);
+
         Memory<byte> slotKey = StorageKeys.SlotKey(record.Ref.Slot);
         Memory<byte> slotHash = record.Ref.Hash;
         _hashBySlot.Upsert(ref slotKey, ref slotHash);
@@ -100,6 +111,12 @@ public sealed class ZoneTreeBlockStore : IBlockStore
         Memory<byte> bytes = default;
         if (_blocksByHash.TryGet(ref hashKey, out bytes))
         {
+            if (_refByHash.TryGet(ref hashKey, out var refPayload))
+            {
+                record = new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray());
+                return true;
+            }
+
             record = new BlockRecord(new BlockRef(0, hash, 0, 0), bytes.ToArray());
             return true;
         }
@@ -117,6 +134,12 @@ public sealed class ZoneTreeBlockStore : IBlockStore
             Memory<byte> bytes = default;
             if (_blocksByHash.TryGet(ref hash, out bytes))
             {
+                if (_refByHash.TryGet(ref hash, out var refPayload))
+                {
+                    record = new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray());
+                    return true;
+                }
+
                 record = new BlockRecord(new BlockRef(slot, hash.ToArray(), 0, 0), bytes.ToArray());
                 return true;
             }
@@ -135,6 +158,12 @@ public sealed class ZoneTreeBlockStore : IBlockStore
             Memory<byte> bytes = default;
             if (_blocksByHash.TryGet(ref hash, out bytes))
             {
+                if (_refByHash.TryGet(ref hash, out var refPayload))
+                {
+                    record = new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray());
+                    return true;
+                }
+
                 record = new BlockRecord(new BlockRef(0, hash.ToArray(), height, 0), bytes.ToArray());
                 return true;
             }
@@ -146,16 +175,11 @@ public sealed class ZoneTreeBlockStore : IBlockStore
 
     public IReadOnlyList<BlockRecord> GetHistory(BlockRef? startToken, int maxItems, out BlockRef? nextToken)
     {
-        if (maxItems <= 0)
-        {
-            nextToken = null;
-            return Array.Empty<BlockRecord>();
-        }
-
         var iterator = _hashBySlot.CreateIterator(
             IteratorType.AutoRefresh,
             includeDeletedRecords: false,
             contributeToTheBlockCache: false);
+
         if (startToken is not null)
         {
             Memory<byte> startKey = StorageKeys.SlotKey(startToken.Value.Slot);
@@ -166,34 +190,56 @@ public sealed class ZoneTreeBlockStore : IBlockStore
             iterator.SeekFirst();
         }
 
-        List<BlockRecord> results = new(maxItems);
-        while (iterator.HasCurrent && results.Count < maxItems)
+        if (!iterator.Next())
         {
-            var slot = BinaryPrimitives.ReadUInt64BigEndian(iterator.CurrentKey.Span);
+            nextToken = null;
+            return Array.Empty<BlockRecord>();
+        }
+
+        if (maxItems <= 0)
+        {
+            nextToken = BuildRef(iterator.CurrentKey, iterator.CurrentValue);
+            return Array.Empty<BlockRecord>();
+        }
+
+        List<BlockRecord> results = new(maxItems);
+        int count = 0;
+
+        while (true)
+        {
             var hash = iterator.CurrentValue;
-            if (!_blocksByHash.TryGet(ref hash, out var bytes))
+            if (_blocksByHash.TryGet(ref hash, out var bytes))
             {
-                iterator.Next();
-                continue;
+                if (_refByHash.TryGet(ref hash, out var refPayload))
+                {
+                    results.Add(new BlockRecord(DeserializeBlockRef(refPayload.ToArray()), bytes.ToArray()));
+                }
+                else
+                {
+                    var slot = BinaryPrimitives.ReadUInt64BigEndian(iterator.CurrentKey.Span);
+                    results.Add(new BlockRecord(new BlockRef(slot, hash.ToArray(), 0, 0), bytes.ToArray()));
+                }
             }
 
-            results.Add(new BlockRecord(new BlockRef(slot, hash.ToArray(), 0, 0), bytes.ToArray()));
-            iterator.Next();
-        }
+            count++;
+            if (count >= maxItems)
+            {
+                nextToken = iterator.Next() ? BuildRef(iterator.CurrentKey, iterator.CurrentValue) : null;
+                return results;
+            }
 
-        nextToken = null;
-        if (iterator.HasCurrent)
-        {
-            var slot = BinaryPrimitives.ReadUInt64BigEndian(iterator.CurrentKey.Span);
-            nextToken = new BlockRef(slot, iterator.CurrentValue.ToArray(), 0, 0);
+            if (!iterator.Next())
+            {
+                nextToken = null;
+                return results;
+            }
         }
-
-        return results;
     }
 
     public void Dispose()
     {
         _blocksByHash.Dispose();
+        _refByHash.Dispose();
         _hashBySlot.Dispose();
         _hashByHeight.Dispose();
         _tip.Dispose();
@@ -219,5 +265,16 @@ public sealed class ZoneTreeBlockStore : IBlockStore
         byte[] hash = new byte[hashLen];
         Array.Copy(buffer, 28, hash, 0, hashLen);
         return new BlockRef(slot, hash, height, timestamp);
+    }
+
+    private BlockRef BuildRef(Memory<byte> slotKey, Memory<byte> hash)
+    {
+        if (_refByHash.TryGet(ref hash, out var refPayload))
+        {
+            return DeserializeBlockRef(refPayload.ToArray());
+        }
+
+        var slot = BinaryPrimitives.ReadUInt64BigEndian(slotKey.Span);
+        return new BlockRef(slot, hash.ToArray(), 0, 0);
     }
 }

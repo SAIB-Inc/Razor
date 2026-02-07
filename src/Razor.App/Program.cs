@@ -1,5 +1,9 @@
 using System.Net;
 using Microsoft.AspNetCore.Server.Kestrel.Core;
+using Razor.Core.Storage;
+using Razor.Core.Sync;
+using Razor.Storage;
+using Razor.Sync;
 using Razor.U5C.Sync;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -45,6 +49,13 @@ builder.WebHost.ConfigureKestrel(options =>
 
 builder.Services.AddGrpc();
 builder.Services.AddGrpcReflection();
+
+var dataPath = builder.Configuration["Storage:Path"] ?? "./data";
+builder.Services.AddSingleton<IBlockStore>(_ => new ZoneTreeBlockStore(dataPath));
+builder.Services.AddSingleton<ChainEventHub>();
+builder.Services.AddSingleton<IChainEventSource>(sp => sp.GetRequiredService<ChainEventHub>());
+builder.Services.Configure<ChainSyncOptions>(builder.Configuration.GetSection("Sync"));
+builder.Services.AddHostedService<ChainSyncIndexer>();
 
 var app = builder.Build();
 
