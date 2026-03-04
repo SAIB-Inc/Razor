@@ -6,12 +6,16 @@ using Razor.Storage;
 using Razor.Sync;
 using Razor.U5C.Sync;
 
-var builder = WebApplication.CreateBuilder(args);
+WebApplicationBuilder builder = WebApplication.CreateBuilder(args);
 
-builder.Configuration.AddEnvironmentVariables(prefix: "RAZOR_");
+_ = builder.Configuration.AddEnvironmentVariables(prefix: "RAZOR_");
+_ = builder.Logging.AddFilter("Grpc.AspNetCore.Server", LogLevel.Warning);
+_ = builder.Logging.AddFilter("Microsoft.AspNetCore.Server.Kestrel", LogLevel.Warning);
+_ = builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
+_ = builder.Logging.AddFilter("Microsoft.AspNetCore.Routing.EndpointMiddleware", LogLevel.Warning);
 
-var listenAddress = builder.Configuration["Grpc:ListenAddress"] ?? "http://0.0.0.0:50051";
-if (!Uri.TryCreate(listenAddress, UriKind.Absolute, out var listenUri))
+string listenAddress = builder.Configuration["Grpc:ListenAddress"] ?? "http://0.0.0.0:50051";
+if (!Uri.TryCreate(listenAddress, UriKind.Absolute, out Uri? listenUri))
 {
     throw new InvalidOperationException("Grpc:ListenAddress must be an absolute URI (e.g. http://0.0.0.0:50051).");
 }
@@ -32,7 +36,7 @@ builder.WebHost.ConfigureKestrel(options =>
         return;
     }
 
-    if (IPAddress.TryParse(listenUri.Host, out var ip))
+    if (IPAddress.TryParse(listenUri.Host, out IPAddress? ip))
     {
         options.Listen(ip, listenUri.Port, listenOptions =>
         {
@@ -47,21 +51,30 @@ builder.WebHost.ConfigureKestrel(options =>
     });
 });
 
-builder.Services.AddGrpc();
-builder.Services.AddGrpcReflection();
+_ = builder.Services.AddGrpc();
+_ = builder.Services.AddGrpcReflection();
 
-var dataPath = builder.Configuration["Storage:Path"] ?? "./data";
-builder.Services.AddSingleton<IBlockStore>(_ => new ZoneTreeBlockStore(dataPath));
-builder.Services.AddSingleton<ChainEventHub>();
-builder.Services.AddSingleton<IChainEventSource>(sp => sp.GetRequiredService<ChainEventHub>());
+string dataPath = builder.Configuration["Storage:Path"] ?? "./data";
+_ = builder.Services.AddSingleton<IBlockStore>(_ => new ZoneTreeBlockStore(dataPath));
+_ = builder.Services.AddSingleton<ChainEventHub>();
+_ = builder.Services.AddSingleton<IChainEventSource>(sp => sp.GetRequiredService<ChainEventHub>());
 builder.Services.Configure<ChainSyncOptions>(builder.Configuration.GetSection("Sync"));
-builder.Services.AddHostedService<ChainSyncIndexer>();
 
-var app = builder.Build();
+string shelleyGenesisPath = builder.Configuration["Sync:ShelleyGenesisPath"]
+    ?? Path.Combine(Directory.GetCurrentDirectory(), "shelley-genesis.json");
+if (!File.Exists(shelleyGenesisPath))
+{
+    throw new FileNotFoundException($"Shelley genesis file not found at '{shelleyGenesisPath}'. Set Sync:ShelleyGenesisPath or place shelley-genesis.json in the working directory.");
+}
+_ = builder.Services.AddSingleton(GenesisConfig.LoadFromShelleyGenesis(shelleyGenesisPath));
 
-app.MapGrpcService<SyncServiceImpl>();
-app.MapGrpcReflectionService();
+_ = builder.Services.AddHostedService<ChainSyncIndexer>();
 
-app.MapGet("/", () => "Razor U5C gRPC server is running.");
+WebApplication app = builder.Build();
+
+_ = app.MapGrpcService<SyncServiceHandler>();
+_ = app.MapGrpcReflectionService();
+
+_ = app.MapGet("/", () => "Razor U5C gRPC server is running.");
 
 app.Run();

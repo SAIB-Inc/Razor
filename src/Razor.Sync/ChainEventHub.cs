@@ -12,7 +12,7 @@ public sealed class ChainEventHub : IChainEventSource, IDisposable
 
     public IAsyncEnumerable<ChainEvent> Subscribe(CancellationToken cancellationToken)
     {
-        var channel = Channel.CreateUnbounded<ChainEvent>(new UnboundedChannelOptions
+        Channel<ChainEvent> channel = Channel.CreateUnbounded<ChainEvent>(new UnboundedChannelOptions
         {
             SingleReader = true,
             SingleWriter = false
@@ -26,17 +26,17 @@ public sealed class ChainEventHub : IChainEventSource, IDisposable
 
     public void Publish(ChainEvent chainEvent)
     {
-        foreach (var channel in _channels.Values)
+        foreach (Channel<ChainEvent> channel in _channels.Values)
         {
-            channel.Writer.TryWrite(chainEvent);
+            _ = channel.Writer.TryWrite(chainEvent);
         }
     }
 
     public void Dispose()
     {
-        foreach (var channel in _channels.Values)
+        foreach (Channel<ChainEvent> channel in _channels.Values)
         {
-            channel.Writer.TryComplete();
+            _ = channel.Writer.TryComplete();
         }
 
         _channels.Clear();
@@ -49,18 +49,15 @@ public sealed class ChainEventHub : IChainEventSource, IDisposable
     {
         try
         {
-            await foreach (var item in channel.Reader.ReadAllAsync(cancellationToken))
+            await foreach (ChainEvent item in channel.Reader.ReadAllAsync(cancellationToken).ConfigureAwait(false))
             {
                 yield return item;
             }
         }
-        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
-        {
-        }
         finally
         {
-            _channels.TryRemove(id, out _);
-            channel.Writer.TryComplete();
+            _ = _channels.TryRemove(id, out _);
+            _ = channel.Writer.TryComplete();
         }
     }
 }

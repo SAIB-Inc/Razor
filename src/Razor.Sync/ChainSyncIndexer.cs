@@ -1,8 +1,5 @@
-using System.Formats.Cbor;
-using Chrysalis.Cbor.Extensions.Cardano.Core;
-using Chrysalis.Cbor.Extensions.Cardano.Core.Header;
-using Chrysalis.Cbor.Serialization;
-using Chrysalis.Cbor.Types.Cardano.Core.Header;
+using System.Net.Sockets;
+using Chrysalis.Network.Cbor.BlockFetch;
 using Chrysalis.Network.Cbor.ChainSync;
 using Chrysalis.Network.Cbor.Common;
 using Chrysalis.Network.Multiplexer;
@@ -14,107 +11,234 @@ using Razor.Core.Sync;
 
 namespace Razor.Sync;
 
-public sealed class ChainSyncIndexer : BackgroundService
+public sealed partial class ChainSyncIndexer(
+    IBlockStore blockStore,
+    ChainEventHub events,
+    GenesisConfig genesis,
+    IOptions<ChainSyncOptions> options,
+    ILogger<ChainSyncIndexer> logger) : BackgroundService
 {
-    private static readonly TimeSpan ReconnectDelay = TimeSpan.FromSeconds(5);
-
-    private readonly IBlockStore _blockStore;
-    private readonly ChainEventHub _events;
-    private readonly ChainSyncOptions _options;
-    private readonly ILogger<ChainSyncIndexer> _logger;
+    private readonly IBlockStore _blockStore = blockStore;
+    private readonly ChainEventHub _events = events;
+    private readonly GenesisConfig _genesis = genesis;
+    private readonly ChainSyncOptions _options = options?.Value ?? throw new ArgumentNullException(nameof(options));
+    private readonly ILogger<ChainSyncIndexer> _logger = logger;
     private bool _atTip;
+    private ulong _lastHeaderSlot;
 
-    public ChainSyncIndexer(
-        IBlockStore blockStore,
-        ChainEventHub events,
-        IOptions<ChainSyncOptions> options,
-        ILogger<ChainSyncIndexer> logger)
+    public override void Dispose()
     {
-        _blockStore = blockStore;
-        _events = events;
-        _options = options.Value;
-        _logger = logger;
+        _blockStore.Dispose();
+        _events.Dispose();
+        base.Dispose();
+        GC.SuppressFinalize(this);
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
-        if (!TryGetStartPoint(out Point startPoint, out string? error))
-        {
-            _logger.LogError("ChainSync disabled: {Error}", error);
-            return;
-        }
+        TimeSpan reconnectDelay = TimeSpan.FromSeconds(_options.ReconnectDelaySeconds);
 
         while (!stoppingToken.IsCancellationRequested)
         {
             try
             {
-                await RunOnceAsync(startPoint, stoppingToken);
+                Point startPoint = GetStartPoint();
+                await RunOnceAsync(startPoint, stoppingToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (stoppingToken.IsCancellationRequested)
             {
                 break;
             }
-            catch (Exception ex)
+            catch (IOException ex)
             {
-                _logger.LogError(ex, "ChainSync failed. Reconnecting in {DelaySeconds}s.", ReconnectDelay.TotalSeconds);
-                await Task.Delay(ReconnectDelay, stoppingToken);
+                Log.ChainSyncFailed(_logger, ex, reconnectDelay.TotalSeconds);
+                await Task.Delay(reconnectDelay, stoppingToken).ConfigureAwait(false);
+            }
+            catch (SocketException ex)
+            {
+                Log.ChainSyncFailed(_logger, ex, reconnectDelay.TotalSeconds);
+                await Task.Delay(reconnectDelay, stoppingToken).ConfigureAwait(false);
             }
         }
     }
 
     private async Task RunOnceAsync(Point startPoint, CancellationToken cancellationToken)
     {
-        using PeerClient peer = await ConnectAsync(cancellationToken);
-        await peer.StartAsync(_options.NetworkMagic, TimeSpan.FromSeconds(_options.KeepAliveSeconds));
+        using PeerClient peer = await ConnectAsync(cancellationToken).ConfigureAwait(false);
+        await peer.StartAsync(_options.NetworkMagic, TimeSpan.FromSeconds(_options.KeepAliveSeconds)).ConfigureAwait(false);
 
-        _logger.LogInformation("ChainSync connected. Finding intersection...");
-        ChainSyncMessage intersect = await peer.ChainSync.FindIntersectionAsync([startPoint], cancellationToken);
+        Log.FindingIntersection(_logger);
+        ChainSyncMessage intersect = await peer.ChainSync.FindIntersectionAsync([startPoint], cancellationToken).ConfigureAwait(false);
 
-        switch (intersect)
+        if (intersect is not MessageIntersectFound found)
         {
-            case MessageIntersectFound found:
-                _logger.LogInformation(
-                    "Intersection found at slot {Slot} hash {Hash}",
-                    found.Point.Slot,
-                    ToHex(found.Point.Hash));
-                break;
-
-            case MessageIntersectNotFound notFound:
-                _logger.LogError(
-                    "Intersection not found. Tip slot {Slot} hash {Hash}",
-                    notFound.Tip.Slot.Slot,
-                    ToHex(notFound.Tip.Slot.Hash));
-                return;
-
-            default:
-                _logger.LogError("Unexpected intersection response.");
-                return;
+            if (intersect is MessageIntersectNotFound notFound && notFound.Tip.Slot is SpecificPoint tipPoint)
+            {
+                Log.IntersectionNotFoundWithTip(_logger, tipPoint.Slot, ToHex(tipPoint.Hash.Span));
+            }
+            else
+            {
+                Log.IntersectionNotFound(_logger);
+            }
+            return;
         }
+
+        Point tipPoint2 = found.Tip?.Slot ?? Point.Origin;
+        if (found.Point is SpecificPoint sp)
+        {
+            Log.IntersectionFound(_logger, sp.Slot, ToHex(sp.Hash.Span));
+        }
+        else
+        {
+            Log.IntersectionFoundAtOrigin(_logger);
+        }
+
+        await RunPipelinedSyncAsync(peer, tipPoint2, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task RunPipelinedSyncAsync(PeerClient peer, Point tipPoint, CancellationToken cancellationToken)
+    {
+        int maxDepth = _options.MaxPipelineDepth;
+        List<PendingBlock> pendingHeaders = new(maxDepth);
 
         while (!cancellationToken.IsCancellationRequested)
         {
-            MessageNextResponse? response = await peer.ChainSync.NextRequestAsync(cancellationToken);
+            int pipelineDepth = ComputeAdaptivePipelineDepth(maxDepth, tipPoint);
+            await peer.ChainSync.SendNextRequestBatchAsync(pipelineDepth, cancellationToken).ConfigureAwait(false);
 
-            switch (response)
+            bool hitAwait = false;
+            int received = 0;
+
+            while (received < pipelineDepth && !cancellationToken.IsCancellationRequested)
             {
-                case MessageRollForward rollForward:
-                    _atTip = false;
-                    HandleRollForward(rollForward);
-                    break;
+                MessageNextResponse response = await peer.ChainSync.ReceiveNextResponseAsync(cancellationToken).ConfigureAwait(false);
+                received++;
 
-                case MessageRollBackward rollBackward:
-                    _atTip = false;
-                    HandleRollBackward(rollBackward);
-                    break;
+                switch (response)
+                {
+                    case MessageRollForward rollForward:
+                        _atTip = false;
+                        if (TryDecodeHeader(rollForward.Payload.Value, out HeaderInfo header))
+                        {
+                            pendingHeaders.Add(new PendingBlock(header, rollForward.Tip));
+                            _lastHeaderSlot = header.Slot;
+                            tipPoint = rollForward.Tip?.Slot ?? tipPoint;
+                        }
+                        else
+                        {
+                            Log.FailedToDecodeHeader(_logger);
+                        }
+                        break;
 
-                case MessageAwaitReply:
-                    if (!_atTip)
-                    {
-                        _logger.LogInformation("ChainSync: Awaiting next block.");
-                        _atTip = true;
-                    }
+                    case MessageRollBackward rollBackward:
+                        _atTip = false;
+                        if (pendingHeaders.Count > 0)
+                        {
+                            await FetchAndApplyBatchAsync(peer, pendingHeaders, cancellationToken).ConfigureAwait(false);
+                            pendingHeaders.Clear();
+                        }
+                        HandleRollBackward(rollBackward);
+                        tipPoint = rollBackward.Tip?.Slot ?? tipPoint;
+                        break;
+
+                    case MessageAwaitReply:
+                        hitAwait = true;
+                        break;
+
+                    default:
+                        break;
+                }
+
+                if (hitAwait)
+                {
                     break;
+                }
             }
+
+            if (pendingHeaders.Count > 0)
+            {
+                await FetchAndApplyBatchAsync(peer, pendingHeaders, cancellationToken).ConfigureAwait(false);
+                pendingHeaders.Clear();
+            }
+
+            if (hitAwait)
+            {
+                if (!_atTip)
+                {
+                    Log.AwaitingNextBlock(_logger);
+                    _atTip = true;
+                }
+
+                MessageNextResponse tipResponse = await peer.ChainSync.NextRequestAsync(cancellationToken).ConfigureAwait(false)
+                    ?? throw new InvalidOperationException("Unexpected null response after AwaitReply.");
+
+                switch (tipResponse)
+                {
+                    case MessageRollForward rollForward:
+                        _atTip = false;
+                        if (TryDecodeHeader(rollForward.Payload.Value, out HeaderInfo header))
+                        {
+                            pendingHeaders.Add(new PendingBlock(header, rollForward.Tip));
+                            _lastHeaderSlot = header.Slot;
+                            tipPoint = rollForward.Tip?.Slot ?? tipPoint;
+                            await FetchAndApplyBatchAsync(peer, pendingHeaders, cancellationToken).ConfigureAwait(false);
+                            pendingHeaders.Clear();
+                        }
+                        else
+                        {
+                            Log.FailedToDecodeHeader(_logger);
+                        }
+                        break;
+
+                    case MessageRollBackward rollBackward:
+                        _atTip = false;
+                        HandleRollBackward(rollBackward);
+                        tipPoint = rollBackward.Tip?.Slot ?? tipPoint;
+                        break;
+
+                    default:
+                        break;
+                }
+            }
+        }
+    }
+
+    private async Task FetchAndApplyBatchAsync(
+        PeerClient peer,
+        List<PendingBlock> headers,
+        CancellationToken cancellationToken)
+    {
+        if (headers.Count == 0)
+        {
+            return;
+        }
+
+        Point from = Point.Specific(headers[0].Header.Slot, headers[0].Header.Hash);
+        Point to = Point.Specific(headers[^1].Header.Slot, headers[^1].Header.Hash);
+
+        await peer.BlockFetch.RequestRangeAsync(from, to, cancellationToken).ConfigureAwait(false);
+
+        int index = 0;
+        await foreach (BlockFetchMessage msg in peer.BlockFetch.ReceiveBlockMessagesAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (msg is not BlockBody blockBody || index >= headers.Count)
+            {
+                continue;
+            }
+
+            PendingBlock pending = headers[index];
+            ulong timestamp = _genesis.SlotToTimestamp(pending.Header.Slot);
+            BlockRecord record = new(
+                new BlockRef(pending.Header.Slot, pending.Header.Hash, pending.Header.BlockNumber, timestamp),
+                blockBody.Body.Value);
+
+            _blockStore.Apply(record);
+
+            BlockRef? tip = ToBlockRef(pending.Tip) ?? record.Ref;
+            Log.RollForward(_logger, record.Ref.Slot, ToHex(record.Ref.Hash.Span), record.Ref.Height);
+            _events.Publish(new ChainEvent(ChainEventKind.Apply, record, null, tip));
+
+            index++;
         }
     }
 
@@ -122,118 +246,75 @@ public sealed class ChainSyncIndexer : BackgroundService
     {
         if (!string.IsNullOrWhiteSpace(_options.SocketPath))
         {
-            _logger.LogInformation("Connecting to node via Unix socket {SocketPath}", _options.SocketPath);
-            return await PeerClient.ConnectAsync(_options.SocketPath, cancellationToken);
+            Log.ConnectingUnixSocket(_logger, _options.SocketPath);
+            return await PeerClient.ConnectAsync(_options.SocketPath, cancellationToken).ConfigureAwait(false);
         }
 
-        _logger.LogInformation("Connecting to node via TCP {Host}:{Port}", _options.TcpHost, _options.TcpPort);
-        return await PeerClient.ConnectAsync(_options.TcpHost, _options.TcpPort, cancellationToken);
-    }
-
-    private void HandleRollForward(MessageRollForward rollForward)
-    {
-        if (!TryDecodeHeader(rollForward.Payload.Value, out HeaderInfo header))
-        {
-            _logger.LogWarning("Failed to decode block header. Skipping rollforward.");
-            return;
-        }
-
-        var record = new BlockRecord(
-            new BlockRef(header.Slot, header.Hash, header.BlockNumber, 0),
-            rollForward.Payload.Value);
-
-        _blockStore.Apply(record);
-
-        BlockRef? tip = ToBlockRef(rollForward.Tip) ?? record.Ref;
-        _logger.LogInformation(
-            "ChainSync: RollForward Slot={Slot} Hash={Hash} Height={Height}",
-            record.Ref.Slot,
-            ToHex(record.Ref.Hash),
-            record.Ref.Height);
-        _events.Publish(new ChainEvent(ChainEventKind.Apply, record, null, tip));
+        Log.ConnectingTcp(_logger, _options.TcpHost, _options.TcpPort);
+        return await PeerClient.ConnectAsync(_options.TcpHost, _options.TcpPort, cancellationToken).ConfigureAwait(false);
     }
 
     private void HandleRollBackward(MessageRollBackward rollBackward)
     {
-        var point = new BlockRef(rollBackward.Point.Slot, rollBackward.Point.Hash, 0, 0);
+        if (rollBackward.Point is not SpecificPoint sp)
+        {
+            Log.RollBackwardToOrigin(_logger);
+            return;
+        }
+
+        BlockRef point = new(sp.Slot, sp.Hash, 0, 0);
         _blockStore.RollbackTo(point);
 
         BlockRef? tip = ToBlockRef(rollBackward.Tip);
-        _logger.LogInformation(
-            "ChainSync: RollBackward Slot={Slot} Hash={Hash}",
-            point.Slot,
-            ToHex(point.Hash));
+        Log.RollBackward(_logger, point.Slot, ToHex(point.Hash.Span));
         _events.Publish(new ChainEvent(ChainEventKind.Reset, null, point, tip));
     }
 
     private static BlockRef? ToBlockRef(Tip tip)
     {
+        return tip?.Slot is not SpecificPoint sp
+            ? null
+            : new BlockRef(sp.Slot, sp.Hash, tip.BlockNumber is >= 0 ? (ulong)tip.BlockNumber.Value : 0, 0);
+    }
+
+    private Point GetStartPoint()
+    {
+        BlockRef? tip = _blockStore.GetTip();
         if (tip is null)
         {
-            return null;
+            Log.SyncingFromOrigin(_logger);
+            return Point.Origin;
         }
 
-        ulong height = tip.BlockNumber is >= 0 ? (ulong)tip.BlockNumber.Value : 0;
-        return new BlockRef(tip.Slot.Slot, tip.Slot.Hash, height, 0);
+        Log.SyncingFromTip(_logger, tip.Value.Slot, ToHex(tip.Value.Hash.Span));
+        return Point.Specific(tip.Value.Slot, tip.Value.Hash);
     }
 
-    private bool TryGetStartPoint(out Point startPoint, out string? error)
+    private int ComputeAdaptivePipelineDepth(int maxDepth, Point tipPoint)
     {
-        startPoint = default!;
-        error = null;
-
-        if (string.IsNullOrWhiteSpace(_options.StartHash))
+        if (tipPoint is not SpecificPoint tip || _lastHeaderSlot == 0)
         {
-            var tip = _blockStore.GetTip();
-            if (tip is null)
-            {
-                error = "Sync:StartHash is required (hex string) unless storage already has a tip.";
-                return false;
-            }
-
-            startPoint = new Point(tip.Value.Slot, tip.Value.Hash);
-            return true;
+            return maxDepth;
         }
 
-        if (!TryParseHash(_options.StartHash, out byte[] hash, out error))
-        {
-            return false;
-        }
+        ulong tipGap = tip.Slot > _lastHeaderSlot ? tip.Slot - _lastHeaderSlot : 0;
 
-        startPoint = new Point(_options.StartSlot, hash);
-        return true;
+        int depth = tipGap switch
+        {
+            <= 4 => 1,
+            <= 20 => 2,
+            <= 100 => 5,
+            <= 500 => 20,
+            <= 2000 => 100,
+            <= 10000 => 500,
+            <= 50000 => 2000,
+            _ => maxDepth
+        };
+
+        return Math.Min(depth, maxDepth);
     }
 
-    private static bool TryParseHash(string value, out byte[] hash, out string? error)
-    {
-        hash = Array.Empty<byte>();
-        error = null;
-
-        string normalized = value.Trim();
-        if (normalized.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-        {
-            normalized = normalized[2..];
-        }
-
-        if (normalized.Length == 0 || normalized.Length % 2 != 0)
-        {
-            error = "Hash must be a non-empty hex string with an even length.";
-            return false;
-        }
-
-        try
-        {
-            hash = Convert.FromHexString(normalized);
-            return true;
-        }
-        catch (FormatException)
-        {
-            error = "Hash must be a valid hex string.";
-            return false;
-        }
-    }
-
-    private static bool TryDecodeHeader(byte[] payload, out HeaderInfo headerInfo)
+    private static bool TryDecodeHeader(ReadOnlyMemory<byte> payload, out HeaderInfo headerInfo)
     {
         headerInfo = default;
 
@@ -242,83 +323,73 @@ public sealed class ChainSyncIndexer : BackgroundService
             return false;
         }
 
-        if (!TryExtractHeaderBytes(payload, out byte variant, out byte[] headerBytes))
-        {
-            return false;
-        }
-
-        if (variant == 0)
-        {
-            return false;
-        }
-
         try
         {
-            BlockHeader header = CborSerializer.Deserialize<BlockHeader>(headerBytes);
-            ulong slot = header.HeaderBody.Slot();
-            ulong blockNumber = header.HeaderBody.BlockNumber();
-            byte[] hash = Convert.FromHexString(header.Hash());
-            headerInfo = new HeaderInfo(slot, blockNumber, hash);
+            ChainSyncHeader content = ChainSyncHeader.Decode(payload);
+            ChainPoint point = content.ExtractPoint();
+            headerInfo = new HeaderInfo(point.Slot, point.BlockNumber, point.Hash);
             return true;
         }
-        catch
+        catch (Exception ex) when (ex is FormatException or InvalidOperationException
+            || ex.GetType().Name == "CborException")
         {
             return false;
         }
     }
 
-    private static bool TryExtractHeaderBytes(byte[] payload, out byte variant, out byte[] headerBytes)
+    private static string ToHex(ReadOnlySpan<byte> bytes)
     {
-        variant = 0;
-        headerBytes = Array.Empty<byte>();
-
-        try
-        {
-            CborReader reader = new(payload, CborConformanceMode.Lax);
-            int? outerLength = reader.ReadStartArray();
-
-            variant = checked((byte)reader.ReadUInt64());
-
-            if (variant == 0)
-            {
-                int? innerLength = reader.ReadStartArray();
-                int? prefixLength = reader.ReadStartArray();
-                _ = reader.ReadUInt64();
-                _ = reader.ReadUInt64();
-
-                if (prefixLength is null)
-                {
-                    reader.ReadEndArray();
-                }
-
-                _ = reader.ReadTag();
-                headerBytes = reader.ReadByteString();
-
-                if (innerLength is null)
-                {
-                    reader.ReadEndArray();
-                }
-            }
-            else
-            {
-                _ = reader.ReadTag();
-                headerBytes = reader.ReadByteString();
-            }
-
-            if (outerLength is null)
-            {
-                reader.ReadEndArray();
-            }
-
-            return headerBytes.Length > 0;
-        }
-        catch
-        {
-            return false;
-        }
+        return Convert.ToHexString(bytes).ToUpperInvariant();
     }
-
-    private static string ToHex(byte[] bytes) => Convert.ToHexString(bytes).ToLowerInvariant();
 
     private readonly record struct HeaderInfo(ulong Slot, ulong BlockNumber, byte[] Hash);
+    private readonly record struct PendingBlock(HeaderInfo Header, Tip Tip);
+
+    private static partial class Log
+    {
+        [LoggerMessage(Level = LogLevel.Information, Message = "No stored tip. Syncing from origin (genesis).")]
+        public static partial void SyncingFromOrigin(ILogger logger);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "Resuming sync from stored tip Slot={Slot} Hash={Hash}")]
+        public static partial void SyncingFromTip(ILogger logger, ulong slot, string hash);
+
+        [LoggerMessage(Level = LogLevel.Error, Message = "ChainSync failed. Reconnecting in {DelaySeconds}s.")]
+        public static partial void ChainSyncFailed(ILogger logger, Exception ex, double delaySeconds);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "ChainSync connected. Finding intersection...")]
+        public static partial void FindingIntersection(ILogger logger);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "Intersection found at slot {Slot} hash {Hash}")]
+        public static partial void IntersectionFound(ILogger logger, ulong slot, string hash);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "Intersection found at origin.")]
+        public static partial void IntersectionFoundAtOrigin(ILogger logger);
+
+        [LoggerMessage(Level = LogLevel.Error, Message = "Intersection not found. Tip slot {Slot} hash {Hash}")]
+        public static partial void IntersectionNotFoundWithTip(ILogger logger, ulong slot, string hash);
+
+        [LoggerMessage(Level = LogLevel.Error, Message = "Intersection not found.")]
+        public static partial void IntersectionNotFound(ILogger logger);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "ChainSync: Awaiting next block.")]
+        public static partial void AwaitingNextBlock(ILogger logger);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "Connecting to node via Unix socket {SocketPath}")]
+        public static partial void ConnectingUnixSocket(ILogger logger, string socketPath);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "Connecting to node via TCP {Host}:{Port}")]
+        public static partial void ConnectingTcp(ILogger logger, string host, int port);
+
+        [LoggerMessage(Level = LogLevel.Warning, Message = "Failed to decode block header. Skipping rollforward.")]
+        public static partial void FailedToDecodeHeader(ILogger logger);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "ChainSync: RollForward Slot={Slot} Hash={Hash} Height={Height}")]
+        public static partial void RollForward(ILogger logger, ulong slot, string hash, ulong height);
+
+        [LoggerMessage(Level = LogLevel.Warning, Message = "ChainSync: RollBackward to origin. Ignoring.")]
+        public static partial void RollBackwardToOrigin(ILogger logger);
+
+        [LoggerMessage(Level = LogLevel.Information, Message = "ChainSync: RollBackward Slot={Slot} Hash={Hash}")]
+        public static partial void RollBackward(ILogger logger, ulong slot, string hash);
+    }
 }

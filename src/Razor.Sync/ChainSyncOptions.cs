@@ -7,6 +7,7 @@ public sealed class ChainSyncOptions
     public int TcpPort { get; set; } = 3001;
     public ulong NetworkMagic { get; set; } = 2;
     public int KeepAliveSeconds { get; set; } = 20;
-    public ulong StartSlot { get; set; }
-    public string? StartHash { get; set; }
+    public int MaxPipelineDepth { get; set; } = 100;
+    public double ReconnectDelaySeconds { get; set; } = 5;
+    public string? ShelleyGenesisPath { get; set; }
 }
