@@ -1,9 +1,9 @@
-using Chrysalis.Cbor.Extensions.Cardano.Core;
-using Chrysalis.Cbor.Extensions.Cardano.Core.Transaction;
-using Chrysalis.Cbor.Serialization;
-using Chrysalis.Cbor.Types.Cardano.Core;
-using Chrysalis.Cbor.Types.Cardano.Core.Common;
-using Chrysalis.Cbor.Types.Cardano.Core.Transaction;
+using Chrysalis.Codec.Extensions.Cardano.Core;
+using Chrysalis.Codec.Extensions.Cardano.Core.Transaction;
+using Chrysalis.Codec.Serialization;
+using Chrysalis.Codec.Types.Cardano.Core;
+using Chrysalis.Codec.Types.Cardano.Core.Common;
+using Chrysalis.Codec.Types.Cardano.Core.Transaction;
 using Google.Protobuf;
 using Grpc.Core;
 using Microsoft.Extensions.Logging;
@@ -11,7 +11,7 @@ using Razor.Core.Storage;
 using Razor.Core.Sync;
 using Utxorpc.V1alpha.Sync;
 using Cardano = Utxorpc.V1alpha.Cardano;
-using CBlock = Chrysalis.Cbor.Types.Cardano.Core.Block;
+using CBlock = Chrysalis.Codec.Types.Cardano.Core.IBlock;
 using CoreBlockRef = Razor.Core.Storage.BlockRef;
 using ProtoBlockRef = Utxorpc.V1alpha.Sync.BlockRef;
 
@@ -247,11 +247,11 @@ public sealed partial class SyncServiceHandler(
     {
         Cardano.BlockBody body = new();
 
-        IEnumerable<TransactionBody> txBodies = block.TransactionBodies();
+        IEnumerable<ITransactionBody> txBodies = block.TransactionBodies();
         HashSet<int>? invalidIndices = block.InvalidTransactions()?.ToHashSet();
 
         int index = 0;
-        foreach (TransactionBody txBody in txBodies)
+        foreach (ITransactionBody txBody in txBodies)
         {
             bool successful = invalidIndices is null || !invalidIndices.Contains(index);
             body.Tx.Add(MapTransaction(txBody, successful));
@@ -261,7 +261,7 @@ public sealed partial class SyncServiceHandler(
         return body;
     }
 
-    private static Cardano.Tx MapTransaction(TransactionBody txBody, bool successful)
+    private static Cardano.Tx MapTransaction(ITransactionBody txBody, bool successful)
     {
         Cardano.Tx tx = new()
         {
@@ -279,7 +279,7 @@ public sealed partial class SyncServiceHandler(
             });
         }
 
-        foreach (TransactionOutput output in txBody.Outputs())
+        foreach (ITransactionOutput output in txBody.Outputs())
         {
             tx.Outputs.Add(MapTxOutput(output));
         }
@@ -287,9 +287,9 @@ public sealed partial class SyncServiceHandler(
         return tx;
     }
 
-    private static Cardano.TxOutput MapTxOutput(TransactionOutput output)
+    private static Cardano.TxOutput MapTxOutput(ITransactionOutput output)
     {
-        Value amount = output.Amount();
+        IValue amount = output.Amount();
         Cardano.TxOutput txOutput = new()
         {
             Address = ByteString.CopyFrom(output.Address().Span)
@@ -298,7 +298,7 @@ public sealed partial class SyncServiceHandler(
         switch (amount)
         {
             case LovelaceWithMultiAsset multiAsset:
-                txOutput.Coin = new Cardano.BigInt { Int = (long)multiAsset.LovelaceValue.Value };
+                txOutput.Coin = new Cardano.BigInt { Int = (long)multiAsset.Amount };
                 foreach (KeyValuePair<ReadOnlyMemory<byte>, TokenBundleOutput> policy in multiAsset.MultiAsset.Value)
                 {
                     Cardano.Multiasset protoAsset = new()
@@ -317,7 +317,7 @@ public sealed partial class SyncServiceHandler(
                 }
                 break;
             case Lovelace lovelace:
-                txOutput.Coin = new Cardano.BigInt { Int = (long)lovelace.Value };
+                txOutput.Coin = new Cardano.BigInt { Int = (long)lovelace.Amount };
                 break;
             default:
                 break;

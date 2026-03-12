@@ -74,7 +74,8 @@ public sealed partial class ChainSyncIndexer(
         {
             if (intersect is MessageIntersectNotFound notFound && notFound.Tip.Slot is SpecificPoint tipPoint)
             {
-                Log.IntersectionNotFoundWithTip(_logger, tipPoint.Slot, ToHex(tipPoint.Hash.Span));
+                string tipHash = ToHex(tipPoint.Hash.Span);
+                Log.IntersectionNotFoundWithTip(_logger, tipPoint.Slot, tipHash);
             }
             else
             {
@@ -86,7 +87,8 @@ public sealed partial class ChainSyncIndexer(
         Point tipPoint2 = found.Tip?.Slot ?? Point.Origin;
         if (found.Point is SpecificPoint sp)
         {
-            Log.IntersectionFound(_logger, sp.Slot, ToHex(sp.Hash.Span));
+            string hash = ToHex(sp.Hash.Span);
+            Log.IntersectionFound(_logger, sp.Slot, hash);
         }
         else
         {
@@ -235,7 +237,8 @@ public sealed partial class ChainSyncIndexer(
             _blockStore.Apply(record);
 
             BlockRef? tip = ToBlockRef(pending.Tip) ?? record.Ref;
-            Log.RollForward(_logger, record.Ref.Slot, ToHex(record.Ref.Hash.Span), record.Ref.Height);
+            string blockHash = ToHex(record.Ref.Hash.Span);
+            Log.RollForward(_logger, record.Ref.Slot, blockHash, record.Ref.Height);
             _events.Publish(new ChainEvent(ChainEventKind.Apply, record, null, tip));
 
             index++;
@@ -266,7 +269,8 @@ public sealed partial class ChainSyncIndexer(
         _blockStore.RollbackTo(point);
 
         BlockRef? tip = ToBlockRef(rollBackward.Tip);
-        Log.RollBackward(_logger, point.Slot, ToHex(point.Hash.Span));
+        string rollbackHash = ToHex(point.Hash.Span);
+        Log.RollBackward(_logger, point.Slot, rollbackHash);
         _events.Publish(new ChainEvent(ChainEventKind.Reset, null, point, tip));
     }
 
@@ -286,7 +290,8 @@ public sealed partial class ChainSyncIndexer(
             return Point.Origin;
         }
 
-        Log.SyncingFromTip(_logger, tip.Value.Slot, ToHex(tip.Value.Hash.Span));
+        string tipHash = ToHex(tip.Value.Hash.Span);
+        Log.SyncingFromTip(_logger, tip.Value.Slot, tipHash);
         return Point.Specific(tip.Value.Slot, tip.Value.Hash);
     }
 
